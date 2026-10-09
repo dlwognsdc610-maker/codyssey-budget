@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Independent CTS: reference item FSM, transition walks, and fault probes."""
+"""
+Independent CTS:
+   reference: item FSM
+   transition: Q-state that walker's transition
+   fault: test case that require probes.
+"""
 
 from __future__ import annotations
 
@@ -40,28 +45,44 @@ def plain(tx: object) -> dict[str, object] | None:
     return value
 
 
+"""
+@class Oracle: 
+   Plain dict/list reference;
+   no production validation, sort, or sums.
+   Directly compare the test case that execution's state transition
+   and it's reference output.
+"""
 class Oracle:
-    """Plain dict/list reference; no production validation, sort, or sums."""
-
     def __init__(self) -> None:
         self.categories: set[str] = set()
         self.budgets: dict[str, int] = {}
         self.items: dict[str, list[dict[str, object]]] = {}
         self.next_id = 1
 
+"""
+We always assume that it's state should be ssa-form structures.
+
+"""
     @staticmethod
-    def define(id_value: str, op: str, state: dict[str, object] | None,
-               old: dict[str, object] | None) -> dict[str, object]:
+    def define(id_value: str,
+               op: str,
+               state: dict[str, object] | None,
+               old: dict[str, object] | None ) -> dict[str, object]:
         version = int(old["version"]) + 1 if old else 1
         predecessor = str(old["hash"]) if old else ""
+
         body = {"id": id_value, "version": version, "op": op,
                 "parent_hash": predecessor, "state": state}
-        digest = hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True,
+
+        digest = hashlib.sha256(json.dumps(body,
+                                           ensure_ascii=False,
+                                           sort_keys=True,
                                            separators=(",", ":")).encode("utf-8")).hexdigest()
         return {**body, "hash": digest}
 
     def apply(self, operation: tuple[object, ...]) -> object:
         action = operation[0]
+        
         if action == "category_add":
             name = str(operation[1])
             if name in self.categories:
@@ -98,14 +119,17 @@ class Oracle:
             if isinstance(state["tags"], tuple):
                 state["tags"] = list(state["tags"])
             chain.append(self.define(str(id_value), "update", state, chain[-1]))
+
         elif action == "delete":
             id_value = str(operation[1])
             chain = self.items.get(id_value)
             if not chain or chain[-1]["state"] is None:
                 raise ValueError("missing item")
             chain.append(self.define(id_value, "delete", None, chain[-1]))
+
         elif action == "budget":
             self.budgets[str(operation[1])] = int(operation[2])
+
         else:
             raise AssertionError(action)
         return None
@@ -423,11 +447,13 @@ class LedgerCTS(unittest.TestCase):
         variants = ("{bad json}\n", '{"bad":1}\n', original + lines[0] + "\n",
                     json.dumps(changed_hash) + "\n" + lines[1] + "\n",
                     lines[1] + "\n" + lines[0] + "\n")
+
         for variant in variants:
             with self.subTest(variant=variant[:30]):
                 path.write_text(variant, encoding="utf-8")
                 with self.assertRaises(LedgerError):
                     list(self.ledger.iter_transactions())
+
         path.write_text(original, encoding="utf-8")
         self.assertEqual(len(list(self.ledger.iter_transactions())), 2)
 
@@ -435,13 +461,16 @@ class LedgerCTS(unittest.TestCase):
         category = self.ledger.categories_path
         budget = self.ledger.budgets_path
         category.write_text('{"name":"food"}\n{"name":"food"}\n', encoding="utf-8")
+
         with self.assertRaises(LedgerError):
             self.ledger.categories()
+
         category.write_text('', encoding="utf-8")
         budget.write_text('{"month":"2024-01","amount":true}\n', encoding="utf-8")
         with self.assertRaises(LedgerError):
             self.ledger.get_budget("2024-01")
-
+         
+    #Must be monotone ids from ssa. 
     def test_concurrent_adds_have_unique_monotone_ids(self) -> None:
         self.ledger.add_category("food")
 
@@ -465,13 +494,15 @@ class LedgerCTS(unittest.TestCase):
         self.assertEqual(next(iterator).amount, 2)
         with self.assertRaises(LedgerError):
             next(iterator)
+
         self.assertEqual(self.cli("list", "--limit", "1").returncode, 0)
         self.assertEqual(self.cli("list", "--limit", "3").returncode, 2)
 
+    
+    # The fixture uses the independent oracle's wire-level revision recipe.
+    # Consumption discards each yielded transaction immediately.
     def test_streaming_memory_bound(self) -> None:
         global MEMORY_PEAKS
-        # The fixture uses the independent oracle's wire-level revision recipe.
-        # Consumption discards each yielded transaction immediately.
         path = self.ledger.transactions_path
 
         def write_fixture(count: int) -> None:
@@ -500,6 +531,7 @@ class LedgerCTS(unittest.TestCase):
         self.assertLess(peaks[1] - peaks[0], 700_000, peaks)
         MEMORY_PEAKS = peaks[0], peaks[1]
 
+    # 
     def test_atomic_write_failures_before_replace(self) -> None:
         self.ledger.add_category("food")
         before = self.bytes()
@@ -510,6 +542,7 @@ class LedgerCTS(unittest.TestCase):
         with mock.patch("budget_app.core.os.replace", side_effect=OSError("replace fault")):
             with self.assertRaises(OSError):
                 self.ledger.add_category("rent")
+                
         self.assertEqual(self.bytes(), before)
         self.assertEqual(list(self.ledger.data_dir.glob(".categories.jsonl.*")), [])
         self.assertEqual(Ledger(self.ledger.data_dir).categories(), ("food",))
@@ -563,11 +596,13 @@ class LedgerCTS(unittest.TestCase):
                  ("category", "add"), ("category", "list"),
                  ("category", "remove"), ("update",), ("delete",),
                  ("import",), ("export",))
+
         for path in paths:
             result = self.cli(*path, "--help")
             self.assertEqual(result.returncode, 0, path)
             self.assertIn("usage:", result.stdout)
         update_help = self.cli("update", "--help").stdout
+
         for option in ("--id", "--date", "--type", "--category", "--amount",
                        "--memo", "--tags"):
             self.assertIn(option, update_help)

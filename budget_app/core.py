@@ -1,9 +1,3 @@
-"""One system for validation, revision transitions, and file persistence.
-
-The three stores have different record shapes, but all mutations use the same
-exclusive lock and same-file atomic replacement primitive. Transactions are a
-date-sorted materialized view of immutable per-item revision chains.
-"""
 
 from __future__ import annotations
 
@@ -24,6 +18,17 @@ from typing import Callable, Iterator, TextIO
 
 from .model import Item, LedgerError, Revision, Summary, Transaction
 
+"""
+@core:
+   validation
+   revision transitions
+   file persistence.
+
+The three stores have different record shapes, but all mutations use the same
+exclusive lock and same-file atomic replacement primitive. Transactions are a
+date-sorted materialized view of immutable per-item revision chains.
+
+"""
 
 CSV_COLUMNS = ("date", "type", "category", "amount", "memo", "tags")
 REQUIRED_CSV = frozenset(CSV_COLUMNS[:4])
@@ -32,7 +37,7 @@ DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 MONTH_RE = re.compile(r"\d{4}-\d{2}\Z")
 HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
 
-
+#Error propagation helper
 def valid_date(value: str) -> str:
     if not isinstance(value, str) or not DATE_RE.fullmatch(value):
         raise LedgerError(f"날짜 형식 오류: {value!r}", "YYYY-MM-DD 형식으로 입력해 줘.")
@@ -140,12 +145,15 @@ def _parse_item(raw: object, path: Path, line: int) -> Item:
     try:
         if not isinstance(raw, dict) or set(raw) != {"id", "sort_date", "revisions"}:
             raise ValueError("item schema")
+
         id_value = raw["id"]
         if not isinstance(id_value, str) or not ID_RE.fullmatch(id_value) or int(id_value[3:]) < 1:
             raise ValueError("id")
+
         versions = raw["revisions"]
         if not isinstance(versions, list) or not versions:
             raise ValueError("empty revisions")
+
         parsed: list[Revision] = []
         last_date: str | None = None
         for data in versions:
@@ -155,19 +163,24 @@ def _parse_item(raw: object, path: Path, line: int) -> Item:
                 raise ValueError("revision schema")
             version, op = data["version"], data["op"]
             parent, stored_hash = data["parent_hash"], data["hash"]
+
             if type(version) is not int or version != len(parsed) + 1:
                 raise ValueError("revision version")
             if not isinstance(parent, str) or not isinstance(stored_hash, str):
                 raise ValueError("hash type")
             expected_parent = parsed[-1].hash if parsed else ""
+
             if parent != expected_parent or (parent and not HEX_RE.fullmatch(parent)):
                 raise ValueError("revision predecessor")
             if not HEX_RE.fullmatch(stored_hash):
                 raise ValueError("hash shape")
+
             state_raw = data["state"]
             state: Transaction | None
+
             if state_raw is None:
                 state = None
+
             else:
                 if not isinstance(state_raw, dict) or set(state_raw) != {
                     "id", "date", "type", "category", "amount", "memo", "tags"

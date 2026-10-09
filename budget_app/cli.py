@@ -16,12 +16,16 @@ from typing import Callable
 from .core import Ledger, parse_amount, parse_tags, valid_amount
 from .model import LedgerError, Transaction
 
+"""
+Entry point-CLI.  
+"""
 
 class HelpParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         self.exit(2, f"[오류] 인자 오류: {message}\n[힌트] --help로 사용법을 확인해 줘.\n")
 
-
+# Callback guard wrapper.
+# Don't care sig-abort.
 def guarded(fn: Callable[[], int]) -> Callable[[], int]:
     """One applied decorator for consistent errors and nonzero exit codes."""
 

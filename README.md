@@ -1,7 +1,6 @@
 # Codyssey 용돈 기입장
 
-Python 3.10 이상과 표준 라이브러리만 사용한다. 실행 위치는 이 폴더다.
-
+Tests:
 ```sh
 cd /home/ljh/self-os/Codyssey/budget
 python3 -m budget_app --help
@@ -11,15 +10,15 @@ python3 -m budget_app --data-dir ./data list --limit 10
 python3 cts.py
 ```
 
-`--data-dir`는 명령 앞에 쓴다. 기본값은 현재 작업 폴더의 `./data`다. 모든 명령과 하위 명령은 `--help`를 제공한다. 처음 실행하면 저장 폴더와 빈 저장 파일 세 개가 생성된다. 초기 카테고리는 비어 있으므로 `category add`로 먼저 등록해야 거래를 추가하거나 CSV를 가져올 수 있다.
+`--data-dir`:  default set ./data
+`--help`: help instruction.
+`category add`: add csv data.
 
-## 명령
+## Instruction:
 
-| 명령 | 사용 예 |
-|---|---|
-| 추가 | `python3 -m budget_app add` — 날짜·타입·카테고리·금액·메모·태그 순서로 대화형 입력 |
-| 목록 | `python3 -m budget_app list --limit 20` — 기본 20건 |
-| 검색 | `python3 -m budget_app search --from 2024-01-01 --to 2024-01-31 --category food --type expense --q 점심 --tag meal` |
+`python3 -m budget_app add`: — 날짜·타입·카테고리·금액·메모·태그 순서로 대화형 입력 
+`python3 -m budget_app list --limit 20`: list, default case 20.
+`python3 -m budget_app search --from 2024-01-01 --to 2024-01-31 --category food --type expense --q 점심 --tag meal` |
 | 요약 | `python3 -m budget_app summary --month 2024-01 --top 3` |
 | 예산 | `python3 -m budget_app budget set --month 2024-01 --amount 500000`; `budget get --month 2024-01` |
 | 카테고리 | `category add --name food`; `category list`; `category remove --name food` — 이름 생략 시 입력 요청 |

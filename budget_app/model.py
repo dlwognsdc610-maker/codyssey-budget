@@ -1,4 +1,3 @@
-"""Immutable values shared by the CLI and the central ledger system."""
 
 from __future__ import annotations
 
@@ -6,6 +5,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 
+"""Immutable values shared by the CLI and the central ledger system."""
 Kind = Literal["income", "expense"]
 
 
