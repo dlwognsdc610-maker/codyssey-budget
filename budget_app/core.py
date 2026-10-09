@@ -13,9 +13,10 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import tempfile
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import asdict, replace
 from datetime import date
 from pathlib import Path
@@ -255,21 +256,35 @@ class Ledger:
 
     def _iter_items(self) -> Iterator[Item]:
         previous: tuple[str, int] | None = None
-        seen: set[str] = set()
-        with self.transactions_path.open("r", encoding="utf-8") as stream:
-            for line_number, line in enumerate(stream, 1):
-                try:
-                    item = _parse_item(json.loads(line), self.transactions_path, line_number)
-                except json.JSONDecodeError as exc:
-                    raise _corrupt(self.transactions_path, line_number, "JSON syntax") from exc
-                order = _key(item)
-                if item.id in seen:
-                    raise _corrupt(self.transactions_path, line_number, "duplicate id")
-                if previous is not None and order > previous:
-                    raise _corrupt(self.transactions_path, line_number, "sort order")
-                seen.add(item.id)
-                previous = order
-                yield item
+        # Date order and stable IDs are separate axes. A temporary on-disk key
+        # set catches duplicate IDs without growing Python memory with the file.
+        with tempfile.TemporaryDirectory(prefix="budget-seen-") as scratch:
+            connection = sqlite3.connect(str(Path(scratch) / "ids.sqlite3"))
+            try:
+                connection.execute("PRAGMA journal_mode=OFF")
+                connection.execute("PRAGMA synchronous=OFF")
+                connection.execute("PRAGMA cache_size=-64")
+                connection.execute("CREATE TABLE seen (id TEXT PRIMARY KEY) WITHOUT ROWID")
+                with self.transactions_path.open("r", encoding="utf-8") as stream:
+                    for line_number, line in enumerate(stream, 1):
+                        try:
+                            item = _parse_item(json.loads(line), self.transactions_path, line_number)
+                        except json.JSONDecodeError as exc:
+                            raise _corrupt(self.transactions_path, line_number, "JSON syntax") from exc
+                        order = _key(item)
+                        try:
+                            connection.execute("INSERT INTO seen (id) VALUES (?)", (item.id,))
+                        except sqlite3.IntegrityError as exc:
+                            raise _corrupt(self.transactions_path, line_number, "duplicate id") from exc
+                        if previous is not None and order > previous:
+                            raise _corrupt(self.transactions_path, line_number, "sort order")
+                        previous = order
+                        yield item
+            except sqlite3.Error as exc:
+                raise LedgerError(f"임시 ID 검증 실패: {exc}",
+                                  "임시 저장 공간을 확인해 줘.") from exc
+            finally:
+                connection.close()
 
     def iter_transactions(self) -> Iterator[Transaction]:
         for item in self._iter_items():
@@ -385,9 +400,10 @@ class Ledger:
             names = self._categories()
             if name not in names:
                 raise LedgerError(f"없는 카테고리: {name}", "category list로 목록을 확인해 줘.")
-            if any(tx.category == name for tx in self.iter_transactions()):
-                raise LedgerError(f"사용 중인 카테고리: {name}",
-                                  "해당 거래의 카테고리를 먼저 수정하거나 삭제해 줘.")
+            with closing(self.iter_transactions()) as transactions:
+                if any(tx.category == name for tx in transactions):
+                    raise LedgerError(f"사용 중인 카테고리: {name}",
+                                      "해당 거래의 카테고리를 먼저 수정하거나 삭제해 줘.")
             names.remove(name)
 
             def write(stream: TextIO) -> None:
@@ -470,17 +486,18 @@ class Ledger:
         valid_month(month)
         income = expense = count = 0
         categories: dict[str, int] = defaultdict(int)
-        for tx in self.iter_transactions():
-            if tx.date[:7] > month:
-                continue
-            if tx.date[:7] < month:
-                break
-            count += 1
-            if tx.type == "income":
-                income += tx.amount
-            else:
-                expense += tx.amount
-                categories[tx.category] += tx.amount
+        with closing(self.iter_transactions()) as transactions:
+            for tx in transactions:
+                if tx.date[:7] > month:
+                    continue
+                if tx.date[:7] < month:
+                    break
+                count += 1
+                if tx.type == "income":
+                    income += tx.amount
+                else:
+                    expense += tx.amount
+                    categories[tx.category] += tx.amount
         ranked = tuple(sorted(categories.items(), key=lambda part: (-part[1], part[0])))
         return Summary(income, expense, ranked, count, self.get_budget(month))
 

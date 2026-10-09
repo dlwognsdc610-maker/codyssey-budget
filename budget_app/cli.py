@@ -7,7 +7,9 @@ import csv
 import functools
 import itertools
 import json
+import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 from typing import Callable
 
@@ -31,7 +33,8 @@ def guarded(fn: Callable[[], int]) -> Callable[[], int]:
             print(f"[오류] {exc}", file=sys.stderr)
             print(f"[힌트] {exc.hint}", file=sys.stderr)
             return 2
-        except (OSError, UnicodeError, csv.Error, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, csv.Error, json.JSONDecodeError,
+                sqlite3.Error) as exc:
             print(f"[오류] 파일 처리 실패: {exc}", file=sys.stderr)
             print("[힌트] 경로, 권한, 인코딩과 저장 공간을 확인해 줘.", file=sys.stderr)
             return 2
@@ -125,13 +128,15 @@ def main() -> int:
         print(f"[저장 완료] id={tx.id}")
     elif args.command == "list":
         valid_amount(args.limit)
-        for tx in itertools.islice(ledger.iter_transactions(), args.limit):
-            _show(tx)
+        with closing(ledger.iter_transactions()) as transactions:
+            for tx in itertools.islice(transactions, args.limit):
+                _show(tx)
     elif args.command == "search":
-        for tx in ledger.search(from_date=args.from_date, to_date=args.to_date,
-                                category=args.category, kind=args.kind,
-                                q=args.q, tag=args.tag):
-            _show(tx)
+        with closing(ledger.search(from_date=args.from_date, to_date=args.to_date,
+                                   category=args.category, kind=args.kind,
+                                   q=args.q, tag=args.tag)) as transactions:
+            for tx in transactions:
+                _show(tx)
     elif args.command == "summary":
         valid_amount(args.top)
         info = ledger.summary(args.month)

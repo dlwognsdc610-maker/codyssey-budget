@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import ast
 import csv
 import concurrent.futures
+import gc
 import hashlib
 import itertools
 import json
@@ -13,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from copy import deepcopy
 from dataclasses import asdict
@@ -25,6 +28,8 @@ from budget_app import Ledger, LedgerError
 HERE = Path(__file__).resolve().parent
 FILES = ("transactions.jsonl", "categories.jsonl", "budgets.jsonl")
 WALK_TRANSITIONS = 0
+WALK_DISTRIBUTION: dict[str, int] = {}
+MEMORY_PEAKS: tuple[int, int] | None = None
 
 
 def plain(tx: object) -> dict[str, object] | None:
@@ -139,6 +144,20 @@ class LedgerCTS(unittest.TestCase):
             cwd=HERE, input=input_text, text=True, capture_output=True, timeout=15,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
 
+    def test_python_310_syntax_and_required_boundaries(self) -> None:
+        parsed = {path.name: ast.parse(path.read_text(encoding="utf-8"),
+                                       filename=str(path), feature_version=(3, 10))
+                  for path in (HERE / "budget_app").glob("*.py")}
+        self.assertGreaterEqual(len(parsed), 3)
+        self.assertTrue(any(isinstance(node, ast.ClassDef) and node.name == "Ledger"
+                            for node in parsed["core.py"].body))
+        self.assertTrue(any(isinstance(node, ast.ClassDef) and node.name == "Transaction"
+                            for node in parsed["model.py"].body))
+        self.assertTrue(any(isinstance(node, ast.FunctionDef) and node.name == "main"
+                            and any(isinstance(decorator, ast.Name) and decorator.id == "guarded"
+                                    for decorator in node.decorator_list)
+                            for node in parsed["cli.py"].body))
+
     def invoke(self, operation: tuple[object, ...]) -> object:
         action = operation[0]
         if action == "category_add":
@@ -196,8 +215,12 @@ class LedgerCTS(unittest.TestCase):
             result = self.invoke(operation)
             if expected_id is not None:
                 self.assertEqual(result.id, expected_id)
+            self.assertEqual(sum(old != new for old, new in zip(before, self.bytes())), 1,
+                             "successful transition must replace exactly one data file")
         self.compare(reference)
         WALK_TRANSITIONS += 1
+        label = f"{operation[0]}:{'rejected' if should_fail else 'accepted'}"
+        WALK_DISTRIBUTION[label] = WALK_DISTRIBUTION.get(label, 0) + 1
 
     def test_deterministic_fsm_walks(self) -> None:
         # Each combination traverses absent -> active -> updated -> deleted.
@@ -297,12 +320,28 @@ class LedgerCTS(unittest.TestCase):
         with self.assertRaises(LedgerError):
             list(self.ledger.search(from_date="2024-02-01", to_date="2024-01-01"))
 
+    def test_summary_empty_top_and_budget_get_cli(self) -> None:
+        self.assertIn("데이터 없음", self.cli("summary", "--month", "2024-03").stdout)
+        self.assertIn("설정된 예산 없음", self.cli("budget", "get", "--month", "2024-03").stdout)
+        self.ledger.add_category("food")
+        self.ledger.add_category("rent")
+        self.ledger.add("2024-03-01", "expense", "food", 8)
+        self.ledger.add("2024-03-02", "expense", "rent", 5)
+        self.ledger.set_budget("2024-03", 13)
+        self.assertIn("13원", self.cli("budget", "get", "--month", "2024-03").stdout)
+        report = self.cli("summary", "--month", "2024-03", "--top", "1").stdout
+        self.assertIn("1) food 8원", report)
+        self.assertNotIn("rent 5원", report)
+        self.assertNotIn("초과", report)
+
     def test_category_guard_and_id_never_reused(self) -> None:
         self.ledger.add_category("food")
         first = self.ledger.add("2024-01-01", "expense", "food", 1)
         before = self.bytes()
         with self.assertRaises(LedgerError):
             self.ledger.remove_category("food")
+        self.assertEqual(self.bytes(), before)
+        self.assertEqual(self.cli("category", "remove", "--name", "food").returncode, 2)
         self.assertEqual(self.bytes(), before)
         self.ledger.delete(first.id)
         self.assertEqual(Ledger(self.ledger.data_dir).add("2024-01-01", "expense", "food", 2).id,
@@ -429,6 +468,38 @@ class LedgerCTS(unittest.TestCase):
         self.assertEqual(self.cli("list", "--limit", "1").returncode, 0)
         self.assertEqual(self.cli("list", "--limit", "3").returncode, 2)
 
+    def test_streaming_memory_bound(self) -> None:
+        global MEMORY_PEAKS
+        # The fixture uses the independent oracle's wire-level revision recipe.
+        # Consumption discards each yielded transaction immediately.
+        path = self.ledger.transactions_path
+
+        def write_fixture(count: int) -> None:
+            with path.open("w", encoding="utf-8") as stream:
+                for number in range(count, 0, -1):
+                    id_value = f"TX-{number:06d}"
+                    state = {"id": id_value, "date": "2024-01-01",
+                             "type": "expense", "category": "food", "amount": number,
+                             "memo": "m" * 128, "tags": []}
+                    revision = Oracle.define(id_value, "create", state, None)
+                    revision.pop("id")
+                    record = {"id": id_value, "sort_date": state["date"],
+                              "revisions": [revision]}
+                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        peaks: list[int] = []
+        for size in (500, 10000):
+            write_fixture(size)
+            gc.collect()
+            tracemalloc.start()
+            seen = sum(1 for _ in self.ledger.iter_transactions())
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            self.assertEqual(seen, size)
+            peaks.append(peak)
+        self.assertLess(peaks[1] - peaks[0], 700_000, peaks)
+        MEMORY_PEAKS = peaks[0], peaks[1]
+
     def test_atomic_write_failures_before_replace(self) -> None:
         self.ledger.add_category("food")
         before = self.bytes()
@@ -441,6 +512,18 @@ class LedgerCTS(unittest.TestCase):
                 self.ledger.add_category("rent")
         self.assertEqual(self.bytes(), before)
         self.assertEqual(list(self.ledger.data_dir.glob(".categories.jsonl.*")), [])
+        self.assertEqual(Ledger(self.ledger.data_dir).categories(), ("food",))
+
+    def test_transaction_replace_failure_preserves_reopen(self) -> None:
+        self.ledger.add_category("food")
+        transaction = self.ledger.add("2024-01-01", "expense", "food", 1)
+        before = self.bytes()
+        with mock.patch("budget_app.core.os.replace", side_effect=OSError("replace fault")):
+            with self.assertRaises(OSError):
+                self.ledger.update(transaction.id, amount=2)
+        self.assertEqual(self.bytes(), before)
+        reopened = Ledger(self.ledger.data_dir)
+        self.assertEqual(next(reopened.iter_transactions()).amount, 1)
 
     def test_writer_failure_after_partial_temp_write(self) -> None:
         self.ledger.add_category("food")
@@ -484,7 +567,17 @@ class LedgerCTS(unittest.TestCase):
             result = self.cli(*path, "--help")
             self.assertEqual(result.returncode, 0, path)
             self.assertIn("usage:", result.stdout)
+        update_help = self.cli("update", "--help").stdout
+        for option in ("--id", "--date", "--type", "--category", "--amount",
+                       "--memo", "--tags"):
+            self.assertIn(option, update_help)
         self.assertEqual(self.cli("category", "add", "--name", "food").returncode, 0)
+        alternate = self.folder / "custom-data"
+        result = subprocess.run([sys.executable, "-m", "budget_app", "--data-dir",
+                                 str(alternate), "category", "add", "--name", "rent"],
+                                cwd=HERE, text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(Ledger(alternate).categories(), ("rent",))
         input_text = "2024-01-01\nexpense\nfood\n2\n점심\nmeal\n"
         self.assertIn("TX-000001", self.cli("add", input_text=input_text).stdout)
         self.assertEqual(self.cli("update", "--id", "TX-000001", "--amount", "3").returncode, 0)
@@ -494,6 +587,9 @@ class LedgerCTS(unittest.TestCase):
         self.assertIn("(1 records)", self.cli("export", "--out", str(exported),
                                               "--month", "2024-01").stdout)
         self.assertIn("skipped=1", self.cli("import", "--from", str(exported)).stdout)
+        self.assertEqual(self.cli("update", "--id", "TX-000001", "--memo", "",
+                                  "--tags", "").returncode, 0)
+        self.assertNotIn("TX-000001", self.cli("search", "--tag", "meal").stdout)
         self.assertEqual(self.cli("delete", "--id", "TX-000001").returncode, 0)
         for result in (self.cli("delete", "--id", "TX-000001"),
                        self.cli("summary", "--month", "2024-13"),
@@ -521,4 +617,6 @@ class LedgerCTS(unittest.TestCase):
 if __name__ == "__main__":
     outcome = unittest.main(verbosity=2, exit=False)
     print(f"CTS deterministic transitions: {WALK_TRANSITIONS}")
+    print(f"CTS transition distribution: {dict(sorted(WALK_DISTRIBUTION.items()))}")
+    print(f"CTS streaming peak bytes (500, 10000): {MEMORY_PEAKS}")
     raise SystemExit(0 if outcome.result.wasSuccessful() else 1)
